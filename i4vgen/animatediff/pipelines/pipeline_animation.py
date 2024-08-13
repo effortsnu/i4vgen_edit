@@ -353,6 +353,7 @@ class AnimationPipeline(DiffusionPipeline):
         controlnet_images: torch.FloatTensor = None,
         controlnet_image_index: list = [0],
         controlnet_conditioning_scale: Union[float, List[float]] = 1.0,
+        controlnet_use_simplified_condition_embedding = False,
 
         use_fp16: bool = True,
         p_ni_vsds: float = 0.6,
@@ -365,6 +366,8 @@ class AnimationPipeline(DiffusionPipeline):
             self.vae.to(dtype=torch.float16)
             self.unet.to(dtype=torch.float16)
             self.text_encoder.to(dtype=torch.float16)
+            self.controlnet.to(dtype=torch.float16)
+            controlnet_images = controlnet_images.to(dtype=torch.float16)
 
         # Default height and width to unet
         height = height or self.unet.config.sample_size * self.vae_scale_factor
@@ -412,26 +415,51 @@ class AnimationPipeline(DiffusionPipeline):
         # ---------------------------------
         print('Stage (1): Make image latents')
 
-        # Prepare latent variables
-        image, _, _ = preprocess_img(image)
-        image = torch.from_numpy(image)[None, ...].permute(0, 3, 1, 2)
-        image = image / 255  # [0, 1]
-        image = image * 2 - 1  # [-1, 1]
-        image = image.to(device=device, dtype=self.vae.dtype)
+        # # Prepare latent variables
+        # latents = self.prepare_latents(
+        #     batch_size * num_videos_per_prompt,
+        #     num_channels_latents,
+        #     video_length,
+        #     height,
+        #     width,
+        #     text_embeddings.dtype,
+        #     device,
+        #     generator,
+        #     latents)
+        # latents_dtype = latents.dtype
+
+        ''' May delete below code '''
+        # image, _, _ = preprocess_img(image)
+        # image = torch.from_numpy(image)[None, ...].permute(0, 3, 1, 2)
+        # image = image / 255  # [0, 1]
+        # image = image * 2 - 1  # [-1, 1]
+        # image = image.to(device=device, dtype=self.vae.dtype)
+
         if isinstance(generator, list):
-            latents = [
-                self.vae.encode(image[k : k + 1]).latent_dist.sample(generator[k]) for k in range(batch_size)
-            ]
-            latents = torch.cat(latents, dim=0).to(device=device)
+            if controlnet_use_simplified_condition_embedding:
+                latents = controlnet_images
+            else:
+                pass
+                # latents = [
+                #     self.vae.encode(controlnet_images[k : k + 1]).latent_dist.sample(generator[k]) for k in range(batch_size)
+                # ]
+                # latents = torch.cat(latents, dim=0).to(device=device)
         else:
-            latents = self.vae.encode(image).latent_dist.sample(generator).to(device=device)
+            if controlnet_use_simplified_condition_embedding:
+                latents = controlnet_images
+            else:
+                pass
+                # latents = self.vae.encode(controlnet_images[0].permute(1,0,2,3)).latent_dist.sample(generator).to(device=device)
 
-        latents = torch.nn.functional.interpolate(latents, size=[height // self.vae_scale_factor, width // self.vae_scale_factor])
+        if not controlnet_use_simplified_condition_embedding:
+            latents = torch.nn.functional.interpolate(latents, size=[height // self.vae_scale_factor, width // self.vae_scale_factor])
 
-        latents = latents.unsqueeze(0).unsqueeze(0).expand(num_videos_per_prompt, video_length, -1, -1, -1, -1)
-        latents = latents.permute(2, 0, 3, 1, 4, 5)
-
+            latents = latents.unsqueeze(0).unsqueeze(0).expand(num_videos_per_prompt, video_length, -1, -1, -1, -1)
+            latents = latents.permute(2, 0, 3, 1, 4, 5)
+        else:
+            latents = latents.unsqueeze(1).unsqueeze(3).repeat(1, num_videos_per_prompt, 1, video_length, 1, 1, 1)
         latents = latents.reshape(batch_size * num_videos_per_prompt, num_channels_latents, video_length, height // self.vae_scale_factor,width // self.vae_scale_factor)
+        
         if latents.shape[0] != batch_size * num_videos_per_prompt:
             raise ValueError(f"Unexpected latents shape, got {latents.shape[0]}, expected {batch_size * num_videos_per_prompt}")
         if latents.shape[1] != num_channels_latents:
@@ -443,75 +471,76 @@ class AnimationPipeline(DiffusionPipeline):
         
         latents_dtype = latents.dtype
 
-        ''' Can erase underlines until Stage 2-2 '''
-        '''Stage (1-2): Noise image lantents'''
-        print('Stage (1-2): Noise image latents')
-        noise = torch.randn_like(latents)
-        time_step = torch.tensor(999)
-        latents = self.scheduler.add_noise(latents, noise, time_step)
+        # ''' Can erase underlines until Stage 2-2 '''
+        # '''Stage (1-2): Noise image lantents'''
+        # print('Stage (1-2): Noise image latents')
+        # noise = torch.randn_like(latents)
+        # time_step = torch.tensor(999)
+        # latents = self.scheduler.add_noise(latents, noise, time_step)
 
 
-        # image generation preparation
-        latents = rearrange(latents, "b c f h w -> (b f) c h w").contiguous().unsqueeze(2)
+        # # image generation preparation
+        # latents = rearrange(latents, "b c f h w -> (b f) c h w").contiguous().unsqueeze(2)
         
-        with self.progress_bar(total=num_inference_steps) as progress_bar:
-            for i, t in enumerate(timesteps):
+        # with self.progress_bar(total=num_inference_steps) as progress_bar:
+        #     for i, t in enumerate(timesteps):
 
-                # expand the latents if we are doing classifier free guidance
-                latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
-                latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
+        #         # expand the latents if we are doing classifier free guidance
+        #         latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
+        #         latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
                 
-                # predict the noise residual
-                noise_pred = self.unet(latent_model_input, t, encoder_hidden_states=image_text_embeddings).sample.to(dtype=latents_dtype)
+        #         # predict the noise residual
+        #         noise_pred = self.unet(latent_model_input, t, encoder_hidden_states=image_text_embeddings).sample.to(dtype=latents_dtype)
 
-                # perform guidance
-                if do_classifier_free_guidance:
-                    noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-                    noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+        #         # perform guidance
+        #         if do_classifier_free_guidance:
+        #             noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+        #             noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
 
-                # compute the previous noisy sample x_t -> x_t-1
-                latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs).prev_sample
+        #         # compute the previous noisy sample x_t -> x_t-1
+        #         latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs).prev_sample
 
-                # call the callback, if provided
-                if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
-                    progress_bar.update()
-                    if callback is not None and i % callback_steps == 0:
-                        callback(i, t, latents)
+        #         # call the callback, if provided
+        #         if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
+        #             progress_bar.update()
+        #             if callback is not None and i % callback_steps == 0:
+        #                 callback(i, t, latents)
 
-        '''Stage (1-3): Anchor image selection'''
-        print('Stage (1-3): Anchor image selection')
-        candidate_images = self.decode_latents(latents)
-        candidate_images = self.decode_latents(latents)
-        output_dir = "output_images"  # Directory where you want to save the images
-        os.makedirs(output_dir, exist_ok=True)  # Create the directory if it doesn't exist
+        # '''Stage (1-3): Anchor image selection'''
+        # print('Stage (1-3): Anchor image selection')
+        # candidate_images = self.decode_latents(latents)
+        # output_dir = "output_images"  # Directory where you want to save the images
+        # os.makedirs(output_dir, exist_ok=True)  # Create the directory if it doesn't exist
 
-        candidate_images_pil_list = []
-        candidate_image_paths = []  # List to store paths
-        candidate_image_reward_scores = []
-        for i in range(video_length):
-            candidate_image_pil = candidate_images[i:i + 1]
-            candidate_image_pil = np.squeeze(candidate_image_pil, axis=2)
-            candidate_image_pil = candidate_image_pil.transpose(0, 2, 3, 1)
-            candidate_image_pil = self.numpy_to_pil(candidate_image_pil)
-            # candidate_images_pil_list = candidate_images_pil_list + candidate_image_pil
+        # candidate_images_pil_list = []
+        # candidate_image_paths = []  # List to store paths
+        # candidate_image_reward_scores = []
+        # for i in range(video_length):
+        #     candidate_image_pil = candidate_images[i:i + 1]
+        #     candidate_image_pil = np.squeeze(candidate_image_pil, axis=2)
+        #     candidate_image_pil = candidate_image_pil.transpose(0, 2, 3, 1)
+        #     candidate_image_pil = self.numpy_to_pil(candidate_image_pil)
+        #     # candidate_images_pil_list = candidate_images_pil_list + candidate_image_pil
 
-            for idx, img in enumerate(candidate_image_pil):
-                image_path = os.path.join(output_dir, f"image_{i}_{idx}.png")  # Define the path
-                img.save(image_path)  # Save the image to disk
-                candidate_images_pil_list.append(img)
-                candidate_image_paths.append(image_path)  # Store the path
+        #     for idx, img in enumerate(candidate_image_pil):
+        #         image_path = os.path.join(output_dir, f"image_{i}_{idx}.png")  # Define the path
+        #         img.save(image_path)  # Save the image to disk
+        #         candidate_images_pil_list.append(img)
+        #         candidate_image_paths.append(image_path)  # Store the path
 
-            candidate_image_reward_scores.append(self.image_reward_model.score(prompt, candidate_image_paths[i]))
-        with torch.no_grad():
-            anchor_image_index, anchor_image_score = max(enumerate(candidate_image_reward_scores), key=lambda x: x[1])
-            # print('[candidate_image_reward_scores]', candidate_image_reward_scores)
-            print('Anchor image index:', anchor_image_index, 'Anchor image score:', anchor_image_score)
+        #     candidate_image_reward_scores.append(self.image_reward_model.score(prompt, candidate_image_paths[i]))
+        # with torch.no_grad():
+        #     anchor_image_index, anchor_image_score = max(enumerate(candidate_image_reward_scores), key=lambda x: x[1])
+        #     # print('[candidate_image_reward_scores]', candidate_image_reward_scores)
+        #     print('Anchor image index:', anchor_image_index, 'Anchor image score:', anchor_image_score)
 
-            latents = latents[anchor_image_index:anchor_image_index + 1]
-
+        #     latents = latents[anchor_image_index:anchor_image_index + 1]
             # candidate image snapshot
-            candidate_image_latents = latents.clone()
-            latents = torch.cat([latents] * video_length, dim=2)
+            # candidate_image_latents = latents.clone()
+            # latents = torch.cat([latents] * video_length, dim=2)
+
+        with torch.no_grad():
+            candidate_image_latents = latents[:,:,0:1,:,:].clone()
 
         # with torch.no_grad():
         #     # candidate image snapshot
@@ -606,11 +635,14 @@ class AnimationPipeline(DiffusionPipeline):
                     controlnet_conditioning_mask_shape    = list(controlnet_cond.shape)
                     controlnet_conditioning_mask_shape[1] = 1
                     controlnet_conditioning_mask          = torch.zeros(controlnet_conditioning_mask_shape).to(latents.device)
+                    
+                    if use_fp16:
+                        controlnet_cond = controlnet_cond.to(dtype=torch.float16)
+                        controlnet_conditioning_mask = controlnet_conditioning_mask.to(dtype=torch.float16)
 
                     assert controlnet_images.shape[2] >= len(controlnet_image_index)
                     controlnet_cond[:,:,controlnet_image_index] = controlnet_images[:,:,:len(controlnet_image_index)]
                     controlnet_conditioning_mask[:,:,controlnet_image_index] = 1
-
                     down_block_additional_residuals, mid_block_additional_residual = self.controlnet(
                         controlnet_noisy_latents, t,
                         encoder_hidden_states=controlnet_prompt_embeds,
@@ -627,6 +659,7 @@ class AnimationPipeline(DiffusionPipeline):
                     down_block_additional_residuals = down_block_additional_residuals,
                     mid_block_additional_residual   = mid_block_additional_residual,
                 ).sample.to(dtype=latents_dtype)
+
                 # perform guidance
                 if do_classifier_free_guidance:
                     noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)

@@ -136,6 +136,8 @@ def main(args):
                 dreambooth_model_path      = model_config.get("dreambooth_path", ""),
                 lora_model_path            = model_config.get("lora_model_path", ""),
                 lora_alpha                 = model_config.get("lora_alpha", 0.8),
+                # Support PIA
+                PIA_path                   = model_config.get("PIA_path", ""),
             ).to("cuda")
 
             prompts      = model_config.prompt
@@ -168,6 +170,11 @@ def main(args):
                     width               = model_config.W,
                     height              = model_config.H,
                     video_length        = model_config.L,
+                    use_fp16            = model_config.use_fp16,
+
+                    controlnet_images = controlnet_images,
+                    controlnet_image_index = model_config.get("controlnet_image_index", [0]),
+                    controlnet_use_simplified_condition_embedding = controlnet.use_simplified_condition_embedding,
                 )
 
                 sample, candidate_images, ni_vsds_video = sample.videos, sample.candidate_images, sample.ni_vsds_video

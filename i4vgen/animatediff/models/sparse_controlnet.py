@@ -513,7 +513,6 @@ class SparseControlNetModel(ModelMixin, ConfigMixin):
 
         # 2. pre-process
         sample = self.conv_in(sample)
-        
         if self.concate_conditioning_mask:
             controlnet_cond = torch.cat([controlnet_cond, conditioning_mask], dim=1)
         controlnet_cond = self.controlnet_cond_embedding(controlnet_cond)
