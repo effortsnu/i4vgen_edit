@@ -3,16 +3,22 @@ I4VGen:
   motion_module:
     - "/home/jhpark/AnimateDiff/models/Motion_Module/v3_sd15_mm.ckpt"
 
-  image_path: "/home/jhpark/ImageDataset/0.png"
+  controlnet_image: "/home/jhpark/ImageDataset/0.png"
   dreambooth_path: "/home/jhpark/AnimateDiff/models/DreamBooth_LoRA/rcnzCartoon3d_v10.safetensors"
+  controlnet_path: "/home/jhpark/AnimateDiff/models/SparseCtrl/v3_sd15_sparsectrl_rgb.ckpt"
+  controlnet_config: "/home/jhpark/i4vgen_edit/configs/sparsectrl/latent_condition.yaml"
+  controlnet_image_indexs: [0]
 
-  seed:           [798324, 653282]
+  seed:           [72451]
   steps:          25
   guidance_scale: 7.5
 
+  L: 16
+  H: 512
+  W: 512
+
   prompt:
-    - "a girl is dancing"
-    - "a girl is jumping"
+    - "a girl open her eyes up and staring at some point, is closing her eyes"
 
   n_prompt:
     - ""

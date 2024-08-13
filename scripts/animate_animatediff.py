@@ -24,8 +24,11 @@ from diffusers.utils.import_utils import is_xformers_available
 from einops import rearrange
 from pathlib import Path
 
-# import ImageReward as RM
+import ImageReward as RM
 from PIL import Image
+import torchvision.transforms as transforms
+from i4vgen.animatediff.models.sparse_controlnet import SparseControlNetModel
+import numpy as np
 
 
 def main(args):
@@ -47,20 +50,80 @@ def main(args):
 
             ### >>> create validation pipeline >>> ###
             tokenizer           = CLIPTokenizer.from_pretrained(args.pretrained_model_path, subfolder="tokenizer")
-            text_encoder        = CLIPTextModel.from_pretrained(args.pretrained_model_path, subfolder="text_encoder")
-            vae                 = AutoencoderKL.from_pretrained(args.pretrained_model_path, subfolder="vae")            
-            unet                = UNet3DConditionModel.from_pretrained_2d(args.pretrained_model_path, subfolder="unet", unet_additional_kwargs=OmegaConf.to_container(inference_config.unet_additional_kwargs))
-            # image_reward_model  = RM.load("ImageReward-v1.0")
-            # image = Image.open(model_config.image_path).convert("RGB")
-            image = model_config.image_path
+            text_encoder        = CLIPTextModel.from_pretrained(args.pretrained_model_path, subfolder="text_encoder").cuda()
+            vae                 = AutoencoderKL.from_pretrained(args.pretrained_model_path, subfolder="vae").cuda()    
+            unet                = UNet3DConditionModel.from_pretrained_2d(args.pretrained_model_path, subfolder="unet", unet_additional_kwargs=OmegaConf.to_container(inference_config.unet_additional_kwargs)).cuda()
+            image_reward_model  = RM.load("ImageReward-v1")
+        
+        image_path = None
+
+            # load controlnet model
+        controlnet = controlnet_images = None
+        if model_config.get("controlnet_path", "") != "":
+            assert model_config.get("controlnet_image", "") != ""
+            assert model_config.get("controlnet_config", "") != ""
+            
+            unet.config.num_attention_heads = 8
+            unet.config.projection_class_embeddings_input_dim = None
+
+            controlnet_config = OmegaConf.load(model_config.controlnet_config)
+            controlnet = SparseControlNetModel.from_unet(unet, controlnet_additional_kwargs=controlnet_config.get("controlnet_additional_kwargs", {}))
+
+            print(f"loading controlnet checkpoint from {model_config.controlnet_path} ...")
+            controlnet_state_dict = torch.load(model_config.controlnet_path, map_location="cpu")
+            controlnet_state_dict = controlnet_state_dict["controlnet"] if "controlnet" in controlnet_state_dict else controlnet_state_dict
+            controlnet_state_dict.pop("animatediff_config", "")
+            controlnet.load_state_dict(controlnet_state_dict)
+            controlnet.cuda()
+
+            image_path = model_config.controlnet_image
+            if isinstance(image_path, str): image_path = [image_path]
+
+            print(f"controlnet image path:")
+            for path in image_path: print(path)
+            assert len(image_path) <= model_config.L
+
+            image_transforms = transforms.Compose([
+                transforms.RandomResizedCrop(
+                    (model_config.H, model_config.W), (1.0, 1.0), 
+                    ratio=(model_config.W/model_config.H, model_config.W/model_config.H)
+                ),
+                transforms.ToTensor(),
+            ])
+
+            if model_config.get("normalize_condition_images", False):
+                def image_norm(image):
+                    image = image.mean(dim=0, keepdim=True).repeat(3,1,1)
+                    image -= image.min()
+                    image /= image.max()
+                    return image
+            else: image_norm = lambda x: x
+                
+            controlnet_images = [image_norm(image_transforms(Image.open(path).convert("RGB"))) for path in image_path]
+
+            os.makedirs(os.path.join(savedir, "control_images"), exist_ok=True)
+            for i, image in enumerate(controlnet_images):
+                Image.fromarray((255. * (image.numpy().transpose(1,2,0))).astype(np.uint8)).save(f"{savedir}/control_images/{i}.png")
+
+            controlnet_images = torch.stack(controlnet_images).unsqueeze(0).cuda()
+            controlnet_images = rearrange(controlnet_images, "b f c h w -> b c f h w")
+
+            if controlnet.use_simplified_condition_embedding:
+                num_controlnet_images = controlnet_images.shape[2]
+                controlnet_images = rearrange(controlnet_images, "b c f h w -> (b f) c h w")
+                controlnet_images = vae.encode(controlnet_images * 2. - 1.).latent_dist.sample() * 0.18215
+                controlnet_images = rearrange(controlnet_images, "(b f) c h w -> b c f h w", f=num_controlnet_images)
+            
 
             if is_xformers_available(): 
                 unet.enable_xformers_memory_efficient_attention()
+                if controlnet is not None: controlnet.enable_xformers_memory_efficient_attention()
             else: 
                 assert False
 
             pipeline = AnimationPipeline(
-                vae=vae, text_encoder=text_encoder, tokenizer=tokenizer, unet=unet,
+                image_reward_model, vae=vae, text_encoder=text_encoder, tokenizer=tokenizer, unet=unet,
+                controlnet=controlnet,
                 scheduler=DDIMScheduler(**OmegaConf.to_container(inference_config.noise_scheduler_kwargs)),
             ).to("cuda")
 
@@ -94,15 +157,17 @@ def main(args):
                 print(f"Processing the ({prompt}) prompt")
 
                 # Save intermediate results 
+                assert image_path is not None
+                # There is only one control image
                 sample = pipeline(
-                    image,
+                    image_path[0],
                     prompt,
                     negative_prompt     = n_prompt,
                     num_inference_steps = model_config.steps,
                     guidance_scale      = model_config.guidance_scale,
-                    width               = args.W,
-                    height              = args.H,
-                    video_length        = args.L,
+                    width               = model_config.W,
+                    height              = model_config.H,
+                    video_length        = model_config.L,
                 )
 
                 sample, candidate_images, ni_vsds_video = sample.videos, sample.candidate_images, sample.ni_vsds_video

@@ -28,6 +28,8 @@ from einops import rearrange
 
 from ..models.unet import UNet3DConditionModel
 from i4vgen.animatediff.utils.util import preprocess_img
+import os
+from ..models.sparse_controlnet import SparseControlNetModel
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -44,6 +46,7 @@ class AnimationPipeline(DiffusionPipeline):
 
     def __init__(
         self,
+        image_reward_model,
         vae: AutoencoderKL,
         text_encoder: CLIPTextModel,
         tokenizer: CLIPTokenizer,
@@ -56,8 +59,12 @@ class AnimationPipeline(DiffusionPipeline):
             EulerAncestralDiscreteScheduler,
             DPMSolverMultistepScheduler,
         ],
+        controlnet: Union[SparseControlNetModel, None] = None,
     ):
         super().__init__()
+
+        # image reward model
+        self.image_reward_model = image_reward_model
         
         if hasattr(scheduler.config, "steps_offset") and scheduler.config.steps_offset != 1:
             deprecation_message = (
@@ -113,6 +120,7 @@ class AnimationPipeline(DiffusionPipeline):
             tokenizer=tokenizer,
             unet=unet,
             scheduler=scheduler,
+            controlnet=controlnet,
         )
         self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
     
@@ -340,6 +348,12 @@ class AnimationPipeline(DiffusionPipeline):
         return_dict: bool = True,
         callback: Optional[Callable[[int, int, torch.FloatTensor], None]] = None,
         callback_steps: Optional[int] = 1,
+
+        # support controlnet
+        controlnet_images: torch.FloatTensor = None,
+        controlnet_image_index: list = [0],
+        controlnet_conditioning_scale: Union[float, List[float]] = 1.0,
+
         use_fp16: bool = True,
         p_ni_vsds: float = 0.6,
         p_re: float = 1.,
@@ -413,15 +427,6 @@ class AnimationPipeline(DiffusionPipeline):
             latents = self.vae.encode(image).latent_dist.sample(generator).to(device=device)
 
         latents = torch.nn.functional.interpolate(latents, size=[height // self.vae_scale_factor, width // self.vae_scale_factor])
-        # latents = latents.unsqueeze(1).unsqueeze(3)
-        # latents = latents.expand(
-        #     batch_size,
-        #     num_videos_per_prompt, 
-        #     num_channels_latents,
-        #     video_length,
-        #     height // self.vae_scale_factor,
-        #     width // self.vae_scale_factor,
-        # )
 
         latents = latents.unsqueeze(0).unsqueeze(0).expand(num_videos_per_prompt, video_length, -1, -1, -1, -1)
         latents = latents.permute(2, 0, 3, 1, 4, 5)
@@ -476,14 +481,48 @@ class AnimationPipeline(DiffusionPipeline):
         '''Stage (1-3): Anchor image selection'''
         print('Stage (1-3): Anchor image selection')
         candidate_images = self.decode_latents(latents)
+        candidate_images = self.decode_latents(latents)
+        output_dir = "output_images"  # Directory where you want to save the images
+        os.makedirs(output_dir, exist_ok=True)  # Create the directory if it doesn't exist
+
+        candidate_images_pil_list = []
+        candidate_image_paths = []  # List to store paths
+        candidate_image_reward_scores = []
+        for i in range(video_length):
+            candidate_image_pil = candidate_images[i:i + 1]
+            candidate_image_pil = np.squeeze(candidate_image_pil, axis=2)
+            candidate_image_pil = candidate_image_pil.transpose(0, 2, 3, 1)
+            candidate_image_pil = self.numpy_to_pil(candidate_image_pil)
+            # candidate_images_pil_list = candidate_images_pil_list + candidate_image_pil
+
+            for idx, img in enumerate(candidate_image_pil):
+                image_path = os.path.join(output_dir, f"image_{i}_{idx}.png")  # Define the path
+                img.save(image_path)  # Save the image to disk
+                candidate_images_pil_list.append(img)
+                candidate_image_paths.append(image_path)  # Store the path
+
+            candidate_image_reward_scores.append(self.image_reward_model.score(prompt, candidate_image_paths[i]))
         with torch.no_grad():
+            anchor_image_index, anchor_image_score = max(enumerate(candidate_image_reward_scores), key=lambda x: x[1])
+            # print('[candidate_image_reward_scores]', candidate_image_reward_scores)
+            print('Anchor image index:', anchor_image_index, 'Anchor image score:', anchor_image_score)
+
+            latents = latents[anchor_image_index:anchor_image_index + 1]
+
             # candidate image snapshot
-            candidate_image_latents = latents[0:1].clone() 
-            ## No candidate_image_latents, just pick the first one.
-            ## because we don't use reward model
-            latents = torch.cat([latents[k:k+1] for k in range(len(latents))], dim=2)
-            # latents = torch.cat([latents[0:1]] * video_length, dim=2)
-        print(latents.shape)
+            candidate_image_latents = latents.clone()
+            latents = torch.cat([latents] * video_length, dim=2)
+
+        # with torch.no_grad():
+        #     # candidate image snapshot
+        #     candidate_image_latents = latents[0:1].clone() 
+        #     ## No candidate_image_latents, just pick the first one.
+        #     ## because we don't use reward model
+        #     latents = torch.cat([latents[k:k+1] for k in range(len(latents))], dim=2)
+        #     # latents = torch.cat([latents[0:1]] * video_length, dim=2)
+        # print(latents.shape)
+
+
         # ----------------------------------------------
         # Stage (2): Anchor image-guided video synthesis
         # ----------------------------------------------
@@ -551,9 +590,43 @@ class AnimationPipeline(DiffusionPipeline):
                 latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
                 latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
                 
-                # predict the noise residual
-                noise_pred = self.unet(latent_model_input, t, encoder_hidden_states=text_embeddings).sample.to(dtype=latents_dtype)
+                down_block_additional_residuals = mid_block_additional_residual = None
+                if (getattr(self, "controlnet", None) != None) and (controlnet_images != None):
+                    assert controlnet_images.dim() == 5
 
+                    controlnet_noisy_latents = latent_model_input
+                    controlnet_prompt_embeds = text_embeddings
+
+                    controlnet_images = controlnet_images.to(latents.device)
+
+                    controlnet_cond_shape    = list(controlnet_images.shape)
+                    controlnet_cond_shape[2] = video_length
+                    controlnet_cond = torch.zeros(controlnet_cond_shape).to(latents.device)
+
+                    controlnet_conditioning_mask_shape    = list(controlnet_cond.shape)
+                    controlnet_conditioning_mask_shape[1] = 1
+                    controlnet_conditioning_mask          = torch.zeros(controlnet_conditioning_mask_shape).to(latents.device)
+
+                    assert controlnet_images.shape[2] >= len(controlnet_image_index)
+                    controlnet_cond[:,:,controlnet_image_index] = controlnet_images[:,:,:len(controlnet_image_index)]
+                    controlnet_conditioning_mask[:,:,controlnet_image_index] = 1
+
+                    down_block_additional_residuals, mid_block_additional_residual = self.controlnet(
+                        controlnet_noisy_latents, t,
+                        encoder_hidden_states=controlnet_prompt_embeds,
+                        controlnet_cond=controlnet_cond,
+                        conditioning_mask=controlnet_conditioning_mask,
+                        conditioning_scale=controlnet_conditioning_scale,
+                        guess_mode=False, return_dict=False,
+                    )
+
+                # predict the noise residual
+                noise_pred = self.unet(
+                    latent_model_input, t, 
+                    encoder_hidden_states=text_embeddings,
+                    down_block_additional_residuals = down_block_additional_residuals,
+                    mid_block_additional_residual   = mid_block_additional_residual,
+                ).sample.to(dtype=latents_dtype)
                 # perform guidance
                 if do_classifier_free_guidance:
                     noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)

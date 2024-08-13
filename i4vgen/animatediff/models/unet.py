@@ -322,6 +322,11 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
         encoder_hidden_states: torch.Tensor,
         class_labels: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
+
+        # support controlnet
+        down_block_additional_residuals: Optional[Tuple[torch.Tensor]] = None,
+        mid_block_additional_residual: Optional[torch.Tensor] = None,
+
         return_dict: bool = True,
     ) -> Union[UNet3DConditionOutput, Tuple]:
         r"""
@@ -412,10 +417,24 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
 
             down_block_res_samples += res_samples
 
+        # support controlnet
+        down_block_res_samples = list(down_block_res_samples)
+        if down_block_additional_residuals is not None:
+            for i, down_block_additional_residual in enumerate(down_block_additional_residuals):
+                if down_block_additional_residual.dim() == 4: # boardcast
+                    down_block_additional_residual = down_block_additional_residual.unsqueeze(2)
+                down_block_res_samples[i] = down_block_res_samples[i] + down_block_additional_residual
+
         # mid
         sample = self.mid_block(
             sample, emb, encoder_hidden_states=encoder_hidden_states, attention_mask=attention_mask
         )
+
+        # support controlnet
+        if mid_block_additional_residual is not None:
+            if mid_block_additional_residual.dim() == 4: # boardcast
+                mid_block_additional_residual = mid_block_additional_residual.unsqueeze(2)
+            sample = sample + mid_block_additional_residual
 
         # up
         for i, upsample_block in enumerate(self.up_blocks):
