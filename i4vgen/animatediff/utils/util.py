@@ -12,6 +12,7 @@ from tqdm import tqdm
 from einops import rearrange
 from i4vgen.animatediff.utils.convert_from_ckpt import convert_ldm_unet_checkpoint, convert_ldm_clip_checkpoint, convert_ldm_vae_checkpoint
 from i4vgen.animatediff.utils.convert_lora_safetensor_to_diffusers import convert_lora, convert_motion_lora_ckpt_to_diffusers
+from PIL import Image
 
 
 def zero_rank_print(s):
@@ -157,3 +158,30 @@ def load_weights(
         animation_pipeline = convert_motion_lora_ckpt_to_diffusers(animation_pipeline, motion_lora_state_dict, alpha)
 
     return animation_pipeline
+
+def preprocess_img(img_path, max_size: int = 512):
+    ori_image = Image.open(img_path).convert("RGB")
+
+    width, height = ori_image.size
+
+    long_edge = max(width, height)
+    if long_edge > max_size:
+        scale_factor = max_size / long_edge
+    else:
+        scale_factor = 1
+    width = int(width * scale_factor)
+    height = int(height * scale_factor)
+    ori_image = ori_image.resize((width, height))
+
+    if (width % 8 != 0) or (height % 8 != 0):
+        in_width = (width // 8) * 8
+        in_height = (height // 8) * 8
+    else:
+        in_width = width
+        in_height = height
+        in_image = ori_image
+
+    in_image = ori_image.resize((in_width, in_height))
+    # in_image = ori_image.resize((512, 512))
+    in_image_np = np.array(in_image)
+    return in_image_np, in_height, in_width

@@ -24,7 +24,8 @@ from diffusers.utils.import_utils import is_xformers_available
 from einops import rearrange
 from pathlib import Path
 
-import ImageReward as RM
+# import ImageReward as RM
+from PIL import Image
 
 
 def main(args):
@@ -49,13 +50,17 @@ def main(args):
             text_encoder        = CLIPTextModel.from_pretrained(args.pretrained_model_path, subfolder="text_encoder")
             vae                 = AutoencoderKL.from_pretrained(args.pretrained_model_path, subfolder="vae")            
             unet                = UNet3DConditionModel.from_pretrained_2d(args.pretrained_model_path, subfolder="unet", unet_additional_kwargs=OmegaConf.to_container(inference_config.unet_additional_kwargs))
-            image_reward_model  = RM.load("ImageReward-v1.0")
+            # image_reward_model  = RM.load("ImageReward-v1.0")
+            # image = Image.open(model_config.image_path).convert("RGB")
+            image = model_config.image_path
 
-            if is_xformers_available(): unet.enable_xformers_memory_efficient_attention()
-            else: assert False
+            if is_xformers_available(): 
+                unet.enable_xformers_memory_efficient_attention()
+            else: 
+                assert False
 
             pipeline = AnimationPipeline(
-                image_reward_model=image_reward_model, vae=vae, text_encoder=text_encoder, tokenizer=tokenizer, unet=unet,
+                vae=vae, text_encoder=text_encoder, tokenizer=tokenizer, unet=unet,
                 scheduler=DDIMScheduler(**OmegaConf.to_container(inference_config.noise_scheduler_kwargs)),
             ).to("cuda")
 
@@ -90,6 +95,7 @@ def main(args):
 
                 # Save intermediate results 
                 sample = pipeline(
+                    image,
                     prompt,
                     negative_prompt     = n_prompt,
                     num_inference_steps = model_config.steps,
@@ -108,9 +114,9 @@ def main(args):
                 torchvision.io.write_video(video_name, sample_mp4, fps=8)
 
                 '''candidate_images'''
-                # sample_png = rearrange(candidate_images, "b c f h w -> b c h (f w)").contiguous()
-                # png_name = f"{savedir}/{prompt}-{random_seed}-candidate-images.png"
-                # save_image(sample_png, png_name)
+                sample_png = rearrange(candidate_images, "b c f h w -> b c h (f w)").contiguous()
+                png_name = f"{savedir}/{prompt}-{random_seed}-candidate-images.png"
+                save_image(sample_png, png_name)
 
                 '''ni_vsds_video'''
                 # video_name = f"{savedir}/{prompt}-{random_seed}-ni-vsds-video.mp4"
@@ -125,7 +131,7 @@ def main(args):
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--pretrained_model_path", type=str, default="[path to base T2I diffusion model]",)
+    parser.add_argument("--pretrained_model_path", type=str, default="/home/jhpark/AnimateDiff/models/StableDiffusion",)
     parser.add_argument("--inference_config",      type=str, default="configs/animatediff_configs/inference/inference-v2.yaml")    
     parser.add_argument("--config",                type=str, required=True)
 

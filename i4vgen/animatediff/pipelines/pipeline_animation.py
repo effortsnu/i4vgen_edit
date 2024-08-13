@@ -24,10 +24,10 @@ from diffusers.schedulers import (
     PNDMScheduler,
 )
 from diffusers.utils import deprecate, logging, BaseOutput
-
 from einops import rearrange
 
 from ..models.unet import UNet3DConditionModel
+from i4vgen.animatediff.utils.util import preprocess_img
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -44,7 +44,6 @@ class AnimationPipeline(DiffusionPipeline):
 
     def __init__(
         self,
-        image_reward_model,
         vae: AutoencoderKL,
         text_encoder: CLIPTextModel,
         tokenizer: CLIPTokenizer,
@@ -59,9 +58,6 @@ class AnimationPipeline(DiffusionPipeline):
         ],
     ):
         super().__init__()
-
-        # image reward model
-        self.image_reward_model = image_reward_model
         
         if hasattr(scheduler.config, "steps_offset") and scheduler.config.steps_offset != 1:
             deprecation_message = (
@@ -328,6 +324,7 @@ class AnimationPipeline(DiffusionPipeline):
     @torch.no_grad()
     def __call__(
         self,
+        image,
         prompt: Union[str, List[str]],
         video_length: Optional[int],
         height: Optional[int] = None,
@@ -397,24 +394,57 @@ class AnimationPipeline(DiffusionPipeline):
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
 
         # ---------------------------------
-        # Stage (1): Anchor image synthesis
+        # Stage (1): Make image latents
         # ---------------------------------
-        print('Stage (1): Anchor image synthesis')
+        print('Stage (1): Make image latents')
 
-        '''Stage (1-1): Candidate images synthesis'''
-        print('Stage (1-1): Candidate images synthesis')
         # Prepare latent variables
-        latents = self.prepare_latents(
-            batch_size * num_videos_per_prompt,
-            num_channels_latents,
-            video_length,
-            height,
-            width,
-            text_embeddings.dtype,
-            device,
-            generator,
-            latents)
+        image, _, _ = preprocess_img(image)
+        image = torch.from_numpy(image)[None, ...].permute(0, 3, 1, 2)
+        image = image / 255  # [0, 1]
+        image = image * 2 - 1  # [-1, 1]
+        image = image.to(device=device, dtype=self.vae.dtype)
+        if isinstance(generator, list):
+            latents = [
+                self.vae.encode(image[k : k + 1]).latent_dist.sample(generator[k]) for k in range(batch_size)
+            ]
+            latents = torch.cat(latents, dim=0).to(device=device)
+        else:
+            latents = self.vae.encode(image).latent_dist.sample(generator).to(device=device)
+
+        latents = torch.nn.functional.interpolate(latents, size=[height // self.vae_scale_factor, width // self.vae_scale_factor])
+        # latents = latents.unsqueeze(1).unsqueeze(3)
+        # latents = latents.expand(
+        #     batch_size,
+        #     num_videos_per_prompt, 
+        #     num_channels_latents,
+        #     video_length,
+        #     height // self.vae_scale_factor,
+        #     width // self.vae_scale_factor,
+        # )
+
+        latents = latents.unsqueeze(0).unsqueeze(0).expand(num_videos_per_prompt, video_length, -1, -1, -1, -1)
+        latents = latents.permute(2, 0, 3, 1, 4, 5)
+
+        latents = latents.reshape(batch_size * num_videos_per_prompt, num_channels_latents, video_length, height // self.vae_scale_factor,width // self.vae_scale_factor)
+        if latents.shape[0] != batch_size * num_videos_per_prompt:
+            raise ValueError(f"Unexpected latents shape, got {latents.shape[0]}, expected {batch_size * num_videos_per_prompt}")
+        if latents.shape[1] != num_channels_latents:
+            raise ValueError(f"Unexpected latents shape, got {latents.shape[1]}, expected {num_channels_latents}")
+        if latents.shape[3] != height // self.vae_scale_factor:
+            raise ValueError(f"Unexpected latents shape, got {latents.shape[3]}, expected {height // self.vae_scale_factor}")
+        if latents.shape[4] != width // self.vae_scale_factor:
+            raise ValueError(f"Unexpected latents shape, got {latents.shape[4]}, expected {width // self.vae_scale_factor}")
+        
         latents_dtype = latents.dtype
+
+        ''' Can erase underlines until Stage 2-2 '''
+        '''Stage (1-2): Noise image lantents'''
+        print('Stage (1-2): Noise image latents')
+        noise = torch.randn_like(latents)
+        time_step = torch.tensor(999)
+        latents = self.scheduler.add_noise(latents, noise, time_step)
+
 
         # image generation preparation
         latents = rearrange(latents, "b c f h w -> (b f) c h w").contiguous().unsqueeze(2)
@@ -443,30 +473,17 @@ class AnimationPipeline(DiffusionPipeline):
                     if callback is not None and i % callback_steps == 0:
                         callback(i, t, latents)
 
-        '''Stage (1-2): Anchor image selection'''
-        print('Stage (1-2): Anchor image selection')
+        '''Stage (1-3): Anchor image selection'''
+        print('Stage (1-3): Anchor image selection')
         candidate_images = self.decode_latents(latents)
-
-        candidate_images_pil_list = []
-        for i in range(video_length):
-            candidate_image_pil = candidate_images[i:i + 1]
-            candidate_image_pil = np.squeeze(candidate_image_pil, axis=2)
-            candidate_image_pil = candidate_image_pil.transpose(0, 2, 3, 1)
-            candidate_image_pil = self.numpy_to_pil(candidate_image_pil)
-            candidate_images_pil_list = candidate_images_pil_list + candidate_image_pil
-
         with torch.no_grad():
-            candidate_image_reward_scores = self.image_reward_model.score(prompt, candidate_images_pil_list)
-            anchor_image_index, anchor_image_score = max(enumerate(candidate_image_reward_scores), key=lambda x: x[1])
-            # print('[candidate_image_reward_scores]', candidate_image_reward_scores)
-            print('Anchor image index:', anchor_image_index, 'Anchor image score:', anchor_image_score)
-
-            latents = latents[anchor_image_index:anchor_image_index + 1]
-
             # candidate image snapshot
-            candidate_image_latents = latents.clone()
-            latents = torch.cat([latents] * video_length, dim=2)
-
+            candidate_image_latents = latents[0:1].clone() 
+            ## No candidate_image_latents, just pick the first one.
+            ## because we don't use reward model
+            latents = torch.cat([latents[k:k+1] for k in range(len(latents))], dim=2)
+            # latents = torch.cat([latents[0:1]] * video_length, dim=2)
+        print(latents.shape)
         # ----------------------------------------------
         # Stage (2): Anchor image-guided video synthesis
         # ----------------------------------------------

@@ -3,12 +3,16 @@ I4VGen:
   motion_module:
     - "/home/jhpark/AnimateDiff/models/Motion_Module/v3_sd15_mm.ckpt"
 
-  seed:           [101, 105]
+  image_path: "/home/jhpark/ImageDataset/0.png"
+  dreambooth_path: "/home/jhpark/AnimateDiff/models/DreamBooth_LoRA/rcnzCartoon3d_v10.safetensors"
+
+  seed:           [798324, 653282]
   steps:          25
   guidance_scale: 7.5
 
   prompt:
-    - "a girl is smiling"
+    - "a girl is dancing"
+    - "a girl is jumping"
 
   n_prompt:
     - ""
